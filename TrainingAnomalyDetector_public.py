@@ -1,5 +1,3 @@
-""" "This module contains a training procedure for video anomaly detection."""
-
 import argparse
 from os import makedirs, path
 
@@ -19,49 +17,31 @@ from utils.utils import register_logger
 
 
 def get_args() -> argparse.Namespace:
-    """Reads command line args and returns the parser object the represent the
-    specified arguments."""
+    """Reads command line args and returns the parser object the represent the specified arguments."""
     parser = argparse.ArgumentParser(
-        description="Video Anomaly Detection Training Parser"
-    )
+        description="Video Anomaly Detection Training Parser")
 
     # io
-    parser.add_argument("--features_path", default="features", help="path to features")
+    parser.add_argument("--features_path",
+                        default="features", help="path to features")
     parser.add_argument(
-        "--annotation_path",
-        default="Train_Annotation.txt",
-        help="path to train annotation",
-    )
-    parser.add_argument(
-        "--log_file", type=str, default="log.log", help="set logging file."
-    )
-    parser.add_argument(
-        "--exps_dir",
-        type=str,
-        default="exps",
-        help="path to the directory where models and tensorboard would be saved.",
-    )
-    parser.add_argument(
-        "--checkpoint", type=str, help="load a model for resume training"
-    )
+        "--annotation_path", default="Train_Annotation.txt", help="path to train annotation")
+    parser.add_argument("--log_file", type=str,
+                        default="log.log", help="set logging file.")
+    parser.add_argument("--exps_dir", type=str, default="exps",
+                        help="path to save models & tensorboard logs.")
+    parser.add_argument("--checkpoint", type=str,
+                        help="load a model for resume training")
 
     # optimization
-    parser.add_argument(
-        "--save_every",
-        type=int,
-        default=1,
-        help="epochs interval for saving the model checkpoints",
-    )
-    parser.add_argument("--lr_base", type=float, default=0.01, help="learning rate")
-    parser.add_argument(
-        "--iterations_per_epoch",
-        type=int,
-        default=20000,
-        help="number of training iterations",
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=2, help="number of training epochs"
-    )
+    parser.add_argument("--save_every", type=int, default=1,
+                        help="epochs interval for saving the model checkpoints")
+    parser.add_argument("--lr_base", type=float,
+                        default=0.01, help="learning rate")
+    parser.add_argument("--iterations_per_epoch", type=int,
+                        default=20000, help="number of training iterations")
+    parser.add_argument("--epochs", type=int, default=2,
+                        help="number of training epochs")
 
     return parser.parse_args()
 
@@ -78,8 +58,10 @@ if __name__ == "__main__":
     makedirs(tb_dir, exist_ok=True)
 
     # Optimizations
-    device = get_torch_device()
-    cudnn.benchmark = True  # enable cudnn tune
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Set to GPU 0 (can be changed based on preference)
+    torch.cuda.set_device(0)
+    cudnn.benchmark = True  # Enable cuDNN optimizations
 
     # Data loader
     train_loader = FeaturesLoader(
@@ -95,25 +77,32 @@ if __name__ == "__main__":
         model = TorchModel.load_model(args.checkpoint)
         assert (
             feature_dim == model.model.input_dim
-        ), f"Dimentionality mismatch between input of the model ({model.input_dim}) and the loader ({feature_dim})"
+        ), f"Dimensionality mismatch: model ({model.input_dim}) vs loader ({feature_dim})"
     else:
         network = AnomalyDetector(feature_dim)
         model = TorchModel(network)
 
-    model = model.to(device).train()
-    # Training parameters
-    """
-    In the original paper:
-        lr = 0.01
-        epsilon = 1e-8
-    """
-    optimizer = torch.optim.Adadelta(model.parameters(), lr=args.lr_base, eps=1e-8)
+    # Move model to GPU
+    model = model.to(device)
 
+    # Multi-GPU support (if more than one GPU is available)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)  # Wrap with DataParallel
+
+    model.train()
+
+    # Optimizer
+    optimizer = torch.optim.Adadelta(
+        model.parameters(), lr=args.lr_base, eps=1e-8)
+
+    # Loss function (moved to GPU)
     criterion = RegularizedLoss(model.get_model(), custom_objective).to(device)
 
     # Callbacks
     tb_writer = SummaryWriter(log_dir=tb_dir)
-    model.register_callback(DefaultModelCallback(visualization_dir=args.exps_dir))
+    model.register_callback(DefaultModelCallback(
+        visualization_dir=args.exps_dir))
     model.register_callback(TensorBoardCallback(tb_writer=tb_writer))
 
     # Training
