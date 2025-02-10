@@ -1,4 +1,7 @@
+""" Training procedure for video anomaly detection with multi-GPU optimization."""
+
 import argparse
+import os
 from os import makedirs, path
 
 import torch
@@ -11,45 +14,42 @@ from network.anomaly_detector_model import (
     RegularizedLoss,
     custom_objective,
 )
-from network.TorchUtils import TorchModel, get_torch_device
+from network.TorchUtils import TorchModel
 from utils.callbacks import DefaultModelCallback, TensorBoardCallback
 from utils.utils import register_logger
 
+# Explicitly set both GPUs
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
 
 def get_args() -> argparse.Namespace:
-    """Reads command line args and returns the parser object the represent the specified arguments."""
     parser = argparse.ArgumentParser(
-        description="Video Anomaly Detection Training Parser")
-
-    # io
-    parser.add_argument("--features_path",
-                        default="features", help="path to features")
-    parser.add_argument(
-        "--annotation_path", default="Train_Annotation.txt", help="path to train annotation")
+        description="Video Anomaly Detection Training")
+    parser.add_argument("--features_path", required=True,
+                        help="path to features")
+    parser.add_argument("--annotation_path", required=True,
+                        help="path to train annotation")
     parser.add_argument("--log_file", type=str,
-                        default="log.log", help="set logging file.")
-    parser.add_argument("--exps_dir", type=str, default="exps",
-                        help="path to save models & tensorboard logs.")
+                        default="log.log", help="logging file")
+    parser.add_argument("--exps_dir", type=str,
+                        default="exps", help="experiments directory")
     parser.add_argument("--checkpoint", type=str,
-                        help="load a model for resume training")
-
-    # optimization
+                        help="load model for resume training")
     parser.add_argument("--save_every", type=int, default=1,
-                        help="epochs interval for saving the model checkpoints")
+                        help="checkpoint save interval")
     parser.add_argument("--lr_base", type=float,
                         default=0.01, help="learning rate")
     parser.add_argument("--iterations_per_epoch", type=int,
-                        default=20000, help="number of training iterations")
-    parser.add_argument("--epochs", type=int, default=2,
+                        default=20000, help="training iterations")
+    parser.add_argument("--epochs", type=int, default=20,
                         help="number of training epochs")
-
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = get_args()
 
-    # Register directories
+    # Setup directories
     register_logger(log_file=args.log_file)
     makedirs(args.exps_dir, exist_ok=True)
     models_dir = path.join(args.exps_dir, "models")
@@ -57,11 +57,11 @@ if __name__ == "__main__":
     makedirs(models_dir, exist_ok=True)
     makedirs(tb_dir, exist_ok=True)
 
-    # Optimizations
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Set to GPU 0 (can be changed based on preference)
-    torch.cuda.set_device(0)
-    cudnn.benchmark = True  # Enable cuDNN optimizations
+    # GPU Configuration
+    device = torch.device("cuda")
+    print(f"Available GPUs: {torch.cuda.device_count()}")
+    cudnn.benchmark = True
+    scaler = torch.cuda.amp.GradScaler()
 
     # Data loader
     train_loader = FeaturesLoader(
@@ -72,45 +72,59 @@ if __name__ == "__main__":
 
     feature_dim = train_loader.get_feature_dim
 
-    # Model
-    if args.checkpoint is not None and path.exists(args.checkpoint):
+    # Model setup
+    if args.checkpoint and path.exists(args.checkpoint):
         model = TorchModel.load_model(args.checkpoint)
-        assert (
-            feature_dim == model.model.input_dim
-        ), f"Dimensionality mismatch: model ({model.input_dim}) vs loader ({feature_dim})"
+        assert feature_dim == model.model.input_dim, "Input dimension mismatch"
     else:
         network = AnomalyDetector(feature_dim)
         model = TorchModel(network)
 
-    # Move model to GPU
+    # Multi-GPU setup
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
     model = model.to(device)
 
-    # Multi-GPU support (if more than one GPU is available)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = torch.nn.DataParallel(model)  # Wrap with DataParallel
-
-    model.train()
-
-    # Optimizer
+    # Training setup
     optimizer = torch.optim.Adadelta(
         model.parameters(), lr=args.lr_base, eps=1e-8)
-
-    # Loss function (moved to GPU)
     criterion = RegularizedLoss(model.get_model(), custom_objective).to(device)
 
-    # Callbacks
+    # Tensorboard
     tb_writer = SummaryWriter(log_dir=tb_dir)
     model.register_callback(DefaultModelCallback(
         visualization_dir=args.exps_dir))
     model.register_callback(TensorBoardCallback(tb_writer=tb_writer))
 
-    # Training
-    model.fit(
-        train_iter=train_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        epochs=args.epochs,
-        network_model_path_base=models_dir,
-        save_every=args.save_every,
-    )
+    # Training loop
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
+        for batch in train_loader:
+            optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                loss = criterion(batch)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_loss += loss.item()
+
+        # Print epoch loss
+        print(f"Epoch {epoch+1}/{args.epochs}, Loss: {epoch_loss}")
+
+        # Save checkpoint
+        if (epoch + 1) % args.save_every == 0:
+            model.save(path.join(models_dir, f"model_epoch_{epoch+1}.pth"))
+
+    # Final model save
+    model.save(path.join(models_dir, "final_model.pth"))
+    print("Training completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
